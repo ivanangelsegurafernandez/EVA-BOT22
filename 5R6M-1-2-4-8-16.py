@@ -12815,6 +12815,13 @@ async def cargar_datos_bot(bot, token_actual):
             except Exception:
                 pass
 
+            # Completa proxies CORE13_v2 para evitar falsos "PRE_TRADE incompleto"
+            # cuando el bot aún publica formato legacy en filas no cerradas.
+            try:
+                fila_dict = _enriquecer_scalping_features_row(fila_dict)
+            except Exception:
+                pass
+
             trade_status = str(fila_dict.get("trade_status", "")).strip().upper()
             resultado = normalizar_resultado(fila_dict.get("resultado", ""))
 
