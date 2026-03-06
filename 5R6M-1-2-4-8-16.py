@@ -1069,7 +1069,7 @@ estado_bots = {
         "real_activado_en": 0.0,  
         "ignore_cierres_hasta": 0.0,
         "real_timeout_first_warn": 0.0,
-        "modo_ia": "off",  # Nueva para modo (off, low_data, modelo)
+        "modo_ia": "low_data",  # Arranca visible en warmup para evitar confusión de OFF al inicio
         "ia_seniales": 0,  # contadores para medir IA
         "ia_aciertos": 0,
         "ia_fallos": 0,
@@ -6270,12 +6270,11 @@ def actualizar_prob_ia_bot(bot: str):
         if (not hard_invalid) and age <= IA_PRED_TTL_S and estado_bots[bot].get("prob_ia") is not None:
             # Mantener último dato útil para que la UI no quede en '--'.
             estado_bots[bot]["ia_ready"] = True
-            if str(estado_bots[bot].get("modo_ia", "")).strip().lower() in ("", "off"):
-                estado_bots[bot]["modo_ia"] = "stale"
+            estado_bots[bot]["modo_ia"] = _modo_ia_por_error(err, tiene_prob=True)
         else:
             estado_bots[bot]["ia_ready"] = False
             estado_bots[bot]["prob_ia"] = None
-            estado_bots[bot]["modo_ia"] = "off"
+            estado_bots[bot]["modo_ia"] = _modo_ia_por_error(err, tiene_prob=False)
 
     except Exception:
         # ultra defensivo: no romper loop
@@ -6284,6 +6283,24 @@ def actualizar_prob_ia_bot(bot: str):
             estado_bots[bot]["ia_last_err"] = "UPD_ERR"
         except Exception:
             pass
+
+
+def _modo_ia_por_error(err: str | None, tiene_prob: bool = False) -> str:
+    """Mapea errores de predicción a un modo IA legible para HUD/operativa."""
+    txt = str(err or "").strip().upper()
+    if tiene_prob:
+        return "stale"
+    if not txt:
+        return "low_data"
+    if txt.startswith("LOW_DATA") or txt.startswith("NO_FEATURE_ROW") or txt.startswith("NO_FEATS"):
+        return "low_data"
+    if txt.startswith("IA_ERR"):
+        return "low_data"
+    if txt.startswith("INPUT_DUPLICADO"):
+        return "input_dup"
+    if txt.startswith("FEAT_MISMATCH") or txt.startswith("SCALER_FAIL") or txt.startswith("PRED_FAIL"):
+        return "off"
+    return "low_data"
 
 def _desempatar_probs_ia_por_bot() -> None:
     """
@@ -7044,7 +7061,7 @@ def reiniciar_completo(borrar_csv=False, limpiar_visual_segundos=15, modo_suave=
         estado_bots[bot].update({
             "token": "DEMO",
             "trigger_real": False,
-            "prob_ia": 0.0, "prob_ia_oper": 0.0,
+            "prob_ia": None, "prob_ia_oper": None,
             "ia_ready": False,
             "ciclo_actual": 1,
             "modo_real_anunciado": False,
@@ -7057,7 +7074,7 @@ def reiniciar_completo(borrar_csv=False, limpiar_visual_segundos=15, modo_suave=
             "real_activado_en": 0.0,  
             "ignore_cierres_hasta": 0.0,
             "real_timeout_first_warn": 0.0,
-            "modo_ia": "off",
+            "modo_ia": "low_data",
             "ia_seniales": 0,
             "ia_aciertos": 0,
             "ia_fallos": 0,
@@ -7106,7 +7123,7 @@ def reiniciar_bot(bot, borrar_csv=False):
     estado_bots[bot].update({
         "token": "DEMO", 
         "trigger_real": False,
-        "prob_ia": 0.0, "prob_ia_oper": 0.0,
+        "prob_ia": None, "prob_ia_oper": None,
         "ia_ready": False,
         "ciclo_actual": 1,
         "modo_real_anunciado": False,
@@ -7119,7 +7136,7 @@ def reiniciar_bot(bot, borrar_csv=False):
         "real_activado_en": 0.0,  
         "ignore_cierres_hasta": 0.0,
         "real_timeout_first_warn": 0.0,
-        "modo_ia": "off",
+        "modo_ia": "low_data",
         "ia_seniales": 0,
         "ia_aciertos": 0,
         "ia_fallos": 0,
@@ -8130,7 +8147,8 @@ def oraculo_predict_visible(fila_dict):
                 return prob, "modelo"
 
         # Sin modelo: fallback visual (NO opera, solo pinta)
-        if LOW_DATA_MODE and contar_filas_incremental() >= MIN_FIT_ROWS_LOW:
+        # En low_data mostramos prob exploratoria desde el inicio para evitar "--/OFF" confuso.
+        if LOW_DATA_MODE:
             prob = prob_exploratoria(fila_dict)
             return prob, "low_data"
 
@@ -8139,11 +8157,11 @@ def oraculo_predict_visible(fila_dict):
             prob = prob_exploratoria(fila_dict)
             return prob, "exp"
 
-        return 0.0, "off"
+        return None, "low_data"
 
     except Exception as e:
         print(f"⚠️ IA: Error en predict visible: {e}")
-        return 0.0, "off"
+        return None, "low_data"
 
 def get_threshold_sugerido(default_=0.60):
     global _META_CORRUPT_FLAG
@@ -10866,15 +10884,18 @@ def mostrar_panel():
             exito = "--"
 
         # --- Modo IA ---
-        modo_raw = estado_bots.get(bot, {}).get("modo_ia", "off")
-        modo = str(modo_raw or "off").strip().lower()
+        # HUD: por defecto asumimos low_data (warmup) y reservamos OFF para fallos duros reales.
+        modo_raw = estado_bots.get(bot, {}).get("modo_ia", "low_data")
+        modo = str(modo_raw or "low_data").strip().lower()
 
         # Normalizar variantes típicas que vienen del CSV/estado
         if modo in ("0", "false", "none", "null", ""):
-            modo = "off"
+            modo = "low_data"
         # (extra) por si llega tipo "off algo" o "off-xyz"
         if modo.startswith("off"):
-            modo = "off"
+            err_ui = str(estado_bots.get(bot, {}).get("ia_last_err", "") or "").upper()
+            hard_off = err_ui.startswith("FEAT_MISMATCH") or err_ui.startswith("SCALER_FAIL") or err_ui.startswith("PRED_FAIL")
+            modo = "off" if hard_off else "low_data"
 
         # Meta IA por bot (umbrales UI, etc.) — evita NameError y mantiene tu semáforo estable
         meta = IA_META.get(bot, {}) if "IA_META" in globals() else {}
@@ -11734,8 +11755,8 @@ def resetear_estado_hud(estado_bots: dict):
         estado_bots[bot].update({
             "resultados": [], "ganancias": 0, "perdidas": 0,
             "porcentaje_exito": None, "tamano_muestra": 0,
-            "prob_ia": 0.0, "prob_ia_oper": 0.0, "token": "DEMO",
-            "fuente": None, "modo_ia": "off",
+            "prob_ia": None, "prob_ia_oper": None, "token": "DEMO",
+            "fuente": None, "modo_ia": "low_data",
             "ia_seniales": 0, "ia_aciertos": 0, "ia_fallos": 0, "ia_senal_pendiente": False,
             "ia_prob_senal": None
         })
@@ -12866,18 +12887,18 @@ async def cargar_datos_bot(bot, token_actual):
                     agregar_evento(f"⚠️ {bot}: PRE_TRADE incompleto, faltan {len(missing)} cols: {missing[:5]}")
                     # IMPORTANTE: si falta data, no inventamos 0.0 (queda sin predicción)
                     estado_bots[bot]["prob_ia"] = None
-                    estado_bots[bot]["modo_ia"] = "off"
+                    estado_bots[bot]["modo_ia"] = "low_data"
                     estado_bots[bot]["ia_ready"] = False
 
                     meta = leer_model_meta() or {}
-                    escribir_ia_ack(bot, fila_dict.get("epoch"), None, "OFF", meta)
+                    escribir_ia_ack(bot, fila_dict.get("epoch"), None, "LOW_DATA", meta)
 
                 else:
                     try:
                         prob_ia, modo_ia = oraculo_predict_visible(fila_dict)
 
                         # Normaliza (evita 'OFF' vs 'off' y valores fuera de rango)
-                        modo_norm = str(modo_ia or "off").strip().lower()
+                        modo_norm = str(modo_ia or "low_data").strip().lower()
                         prob_norm = None
                         try:
                             if prob_ia is not None:
@@ -12904,11 +12925,11 @@ async def cargar_datos_bot(bot, token_actual):
                     except Exception as e:
                         agregar_evento(f"⚠️ {bot}: PRED_FAIL pretrade: {type(e).__name__}")
                         estado_bots[bot]["prob_ia"] = None
-                        estado_bots[bot]["modo_ia"] = "off"
+                        estado_bots[bot]["modo_ia"] = "low_data"
                         estado_bots[bot]["ia_ready"] = False
 
                         meta = leer_model_meta() or {}
-                        escribir_ia_ack(bot, fila_dict.get("epoch"), None, "OFF", meta)
+                        escribir_ia_ack(bot, fila_dict.get("epoch"), None, "LOW_DATA", meta)
 
 
 
