@@ -1069,7 +1069,7 @@ estado_bots = {
         "real_activado_en": 0.0,  
         "ignore_cierres_hasta": 0.0,
         "real_timeout_first_warn": 0.0,
-        "modo_ia": "off",  # Nueva para modo (off, low_data, modelo)
+        "modo_ia": "low_data",  # Arranca visible en warmup para evitar confusión de OFF al inicio
         "ia_seniales": 0,  # contadores para medir IA
         "ia_aciertos": 0,
         "ia_fallos": 0,
@@ -6270,12 +6270,11 @@ def actualizar_prob_ia_bot(bot: str):
         if (not hard_invalid) and age <= IA_PRED_TTL_S and estado_bots[bot].get("prob_ia") is not None:
             # Mantener último dato útil para que la UI no quede en '--'.
             estado_bots[bot]["ia_ready"] = True
-            if str(estado_bots[bot].get("modo_ia", "")).strip().lower() in ("", "off"):
-                estado_bots[bot]["modo_ia"] = "stale"
+            estado_bots[bot]["modo_ia"] = _modo_ia_por_error(err, tiene_prob=True)
         else:
             estado_bots[bot]["ia_ready"] = False
             estado_bots[bot]["prob_ia"] = None
-            estado_bots[bot]["modo_ia"] = "off"
+            estado_bots[bot]["modo_ia"] = _modo_ia_por_error(err, tiene_prob=False)
 
     except Exception:
         # ultra defensivo: no romper loop
@@ -6284,6 +6283,24 @@ def actualizar_prob_ia_bot(bot: str):
             estado_bots[bot]["ia_last_err"] = "UPD_ERR"
         except Exception:
             pass
+
+
+def _modo_ia_por_error(err: str | None, tiene_prob: bool = False) -> str:
+    """Mapea errores de predicción a un modo IA legible para HUD/operativa."""
+    txt = str(err or "").strip().upper()
+    if tiene_prob:
+        return "stale"
+    if not txt:
+        return "low_data"
+    if txt.startswith("LOW_DATA") or txt.startswith("NO_FEATURE_ROW") or txt.startswith("NO_FEATS"):
+        return "low_data"
+    if txt.startswith("IA_ERR"):
+        return "low_data"
+    if txt.startswith("INPUT_DUPLICADO"):
+        return "input_dup"
+    if txt.startswith("FEAT_MISMATCH") or txt.startswith("SCALER_FAIL") or txt.startswith("PRED_FAIL"):
+        return "off"
+    return "low_data"
 
 def _desempatar_probs_ia_por_bot() -> None:
     """
