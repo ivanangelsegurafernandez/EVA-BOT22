@@ -8147,7 +8147,8 @@ def oraculo_predict_visible(fila_dict):
                 return prob, "modelo"
 
         # Sin modelo: fallback visual (NO opera, solo pinta)
-        if LOW_DATA_MODE and contar_filas_incremental() >= MIN_FIT_ROWS_LOW:
+        # En low_data mostramos prob exploratoria desde el inicio para evitar "--/OFF" confuso.
+        if LOW_DATA_MODE:
             prob = prob_exploratoria(fila_dict)
             return prob, "low_data"
 
@@ -10892,7 +10893,9 @@ def mostrar_panel():
             modo = "low_data"
         # (extra) por si llega tipo "off algo" o "off-xyz"
         if modo.startswith("off"):
-            modo = "off"
+            err_ui = str(estado_bots.get(bot, {}).get("ia_last_err", "") or "").upper()
+            hard_off = err_ui.startswith("FEAT_MISMATCH") or err_ui.startswith("SCALER_FAIL") or err_ui.startswith("PRED_FAIL")
+            modo = "off" if hard_off else "low_data"
 
         # Meta IA por bot (umbrales UI, etc.) — evita NameError y mantiene tu semáforo estable
         meta = IA_META.get(bot, {}) if "IA_META" in globals() else {}
