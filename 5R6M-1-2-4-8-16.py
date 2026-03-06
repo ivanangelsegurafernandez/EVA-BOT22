@@ -6260,6 +6260,26 @@ def actualizar_prob_ia_bot(bot: str):
         # fallo: no mates la última prob, solo marca error
         estado_bots[bot]["ia_last_err"] = err or "ERR"
 
+        # Fallback activo: si la predicción del modelo falla, intentamos prob exploratoria
+        # para no dejar el HUD en "-- | OFF" durante warmup/desalineaciones temporales.
+        try:
+            row_fb = leer_ultima_fila_features_para_pred(bot)
+        except Exception:
+            row_fb = None
+        if isinstance(row_fb, dict):
+            try:
+                p_fb = float(_predict_prob_low_data_from_row(row_fb))
+            except Exception:
+                p_fb = None
+            if isinstance(p_fb, (int, float)) and np.isfinite(float(p_fb)):
+                p_fb = float(max(0.0, min(1.0, float(p_fb))))
+                estado_bots[bot]["prob_ia"] = p_fb
+                estado_bots[bot]["prob_ia_oper"] = p_fb
+                estado_bots[bot]["ia_ready"] = True
+                estado_bots[bot]["ia_last_prob_ts"] = now
+                estado_bots[bot]["modo_ia"] = "low_data"
+                return
+
         # si hace demasiado que no hay prob válida, limpia a None
         last_ok = float(estado_bots[bot].get("ia_last_prob_ts", 0.0) or 0.0)
         age = (now - last_ok) if last_ok > 0 else 10**9
