@@ -10883,12 +10883,13 @@ def mostrar_panel():
             exito = "--"
 
         # --- Modo IA ---
-        modo_raw = estado_bots.get(bot, {}).get("modo_ia", "off")
-        modo = str(modo_raw or "off").strip().lower()
+        # HUD: por defecto asumimos low_data (warmup) y reservamos OFF para fallos duros reales.
+        modo_raw = estado_bots.get(bot, {}).get("modo_ia", "low_data")
+        modo = str(modo_raw or "low_data").strip().lower()
 
         # Normalizar variantes típicas que vienen del CSV/estado
         if modo in ("0", "false", "none", "null", ""):
-            modo = "off"
+            modo = "low_data"
         # (extra) por si llega tipo "off algo" o "off-xyz"
         if modo.startswith("off"):
             modo = "off"
