@@ -10591,6 +10591,7 @@ def mostrar_panel():
                 f"🧩 WHY-NO: CAP≈{cap_now*100:.1f}% (warmup={'sí' if warmup_live else 'no'}) | "
                 f"AUTO={auto_state} reliable={'sí' if reliable else 'no'} canary={'sí' if canary_live else 'no'} n={n_samples_live} p_raw={p_raw_txt} p_pre={p_pre_txt} p_cap={best_prob*100:.1f}% why={why_txt} | canary_prog={canary_prog_txt} hit={c_hit:.1f}% | "
                 f"ROOF mode={mode_h} confirm={confirm_txt_h} trigger_ok={'sí' if trigger_ok_h else 'no'} trig_force={'sí' if bool(DYN_ROOF_STATE.get('last_trigger_force', False)) else 'no'} gate_consumed={'sí' if clone_gate else 'no'}"
+                f" | CTT={str(CTT_STATE.get('phase', 'neutral'))} score={float(CTT_STATE.get('score', 0.0) or 0.0):+.2f} conf={int(CTT_STATE.get('confirmers_n', 0) or 0)} redu={float(CTT_STATE.get('redu_ratio', 0.0) or 0.0)*100:.0f}% lag={'ok' if bool(CTT_STATE.get('lag_ok', False)) else 'no'}"
             )
             print(padding + Fore.YELLOW + why_line)
             _runtime_audit_append(why_line)
@@ -12132,6 +12133,26 @@ DYN_ROOF_UNRELIABLE_ROOF_OFFSET = 0.03
 DYN_ROOF_MAX_CAP = 0.82
 DYN_ROOF_MAX_CAP_UNRELIABLE = 0.80
 DYN_ROOF_MAX_CAP_WARMUP = 0.78
+# CTT-Fase (consenso temporal de confirmadores): modula ROOF/FLOOR en vez de competir como candado paralelo.
+CTT_ENABLE = True
+CTT_WINDOW_S = 150.0
+CTT_LAG_MIN_S = 45.0
+CTT_LAG_MAX_S = 120.0
+CTT_CONFIRMERS_MIN = 2
+CTT_CONFIRMERS_STRONG_MIN = 3
+CTT_CONFIRMERS_REDU_MIN_RATIO = 0.60
+CTT_RED_STRONG_SCORE = -0.55
+CTT_RED_WEAK_SCORE = -0.25
+CTT_GREEN_WEAK_SCORE = 0.25
+CTT_GREEN_STRONG_SCORE = 0.55
+CTT_RED_STRONG_ROOF_BUMP = 0.03
+CTT_RED_STRONG_FLOOR_BUMP = 0.02
+CTT_RED_WEAK_ROOF_BUMP = 0.015
+CTT_RED_WEAK_FLOOR_BUMP = 0.01
+CTT_GREEN_WEAK_ROOF_RELAX = 0.01
+CTT_GREEN_STRONG_ROOF_RELAX = 0.02
+CTT_GREEN_STRONG_FLOOR_RELAX = 0.02
+CTT_RED_EXTRA_CONFIRM = 1
 REAL_COOLDOWN_UNTIL_TS = 0.0
 LAST_RETRAIN_ERROR = ""
 
@@ -12155,6 +12176,18 @@ DYN_ROOF_STATE = {
     "live_peak_hist": deque(maxlen=int(DYN_ROOF_LIVE_PEAK_WINDOW)),
     "prev_probs": {},
     "last_real_open_ts": 0.0,
+}
+
+CTT_STATE = {
+    "phase": "neutral",
+    "score": 0.0,
+    "wave_start_ts": 0.0,
+    "last_confirm_ts": 0.0,
+    "confirmers": [],
+    "confirmers_n": 0,
+    "redu_ratio": 0.0,
+    "expired": False,
+    "lag_ok": False,
 }
 
 
@@ -12410,6 +12443,107 @@ def _umbral_unrel_operativo(best_bot: str | None, best_prob: float | None = None
         return float(AUTO_REAL_UNRELIABLE_MIN_PROB)
 
 
+def _ctt_phase_confirmers(live: list[tuple], floor_now: float, best_bot: str, p_best: float) -> dict:
+    """
+    CTT-Fase: calcula contexto colectivo usando SOLO confirmadores (no todos los bots).
+    La salida modula severidad de compuerta (ROOF/FLOOR/confirm), priorizando bloqueo en rojo.
+    """
+    out = {
+        "phase": "neutral",
+        "score": 0.0,
+        "confirmers": [],
+        "confirmers_n": 0,
+        "redu_ratio": 0.0,
+        "expired": False,
+        "lag_ok": False,
+        "wave_age_s": 0.0,
+    }
+    try:
+        if (not bool(CTT_ENABLE)) or (not live):
+            return out
+
+        now = float(time.time())
+        floor_anchor = float(max(float(floor_now), float(p_best) - 0.03))
+        confirmers = []
+        stats = []
+        for b, p, _n in live:
+            if float(p) < float(floor_anchor):
+                continue
+            st = estado_bots.get(str(b), {}) if isinstance(estado_bots, dict) else {}
+            wr = float((st.get("porcentaje_exito", 0.0) or 0.0) / 100.0)
+            if not np.isfinite(wr):
+                wr = 0.5
+            wr = max(0.0, min(1.0, wr))
+            ctx = _ultimo_contexto_operativo_bot(str(b))
+            racha = float(ctx.get("racha_actual", 0.0) or 0.0)
+            redu = bool(st.get("ia_input_redundante", False))
+            confirmers.append(str(b))
+            stats.append((wr, racha, redu))
+
+        out["confirmers"] = confirmers
+        out["confirmers_n"] = len(confirmers)
+        if len(confirmers) < int(CTT_CONFIRMERS_MIN):
+            CTT_STATE["phase"] = "neutral"
+            CTT_STATE["score"] = 0.0
+            CTT_STATE["confirmers"] = list(confirmers)
+            CTT_STATE["confirmers_n"] = len(confirmers)
+            CTT_STATE["redu_ratio"] = 0.0
+            CTT_STATE["expired"] = False
+            CTT_STATE["lag_ok"] = False
+            CTT_STATE["wave_start_ts"] = 0.0
+            CTT_STATE["last_confirm_ts"] = 0.0
+            return out
+
+        if float(CTT_STATE.get("wave_start_ts", 0.0) or 0.0) <= 0.0:
+            CTT_STATE["wave_start_ts"] = now
+        CTT_STATE["last_confirm_ts"] = now
+
+        wr_bias = float(np.mean([max(-1.0, min(1.0, (wr - 0.50) / 0.10)) for wr, _r, _d in stats]))
+        racha_bias = float(np.mean([max(-1.0, min(1.0, float(r) / 4.0)) for _w, r, _d in stats]))
+        redu_ratio = float(sum(1 for _w, _r, d in stats if d) / max(1, len(stats)))
+        redund_pen = 0.20 if redu_ratio >= float(CTT_CONFIRMERS_REDU_MIN_RATIO) else 0.0
+        score = float((0.60 * wr_bias) + (0.40 * racha_bias) - redund_pen)
+
+        wave_age = float(max(0.0, now - float(CTT_STATE.get("wave_start_ts", now) or now)))
+        expired = bool(wave_age > float(CTT_WINDOW_S))
+        if expired:
+            score *= 0.5
+            CTT_STATE["wave_start_ts"] = now
+            wave_age = 0.0
+
+        if score <= float(CTT_RED_STRONG_SCORE):
+            phase = "red_strong"
+        elif score <= float(CTT_RED_WEAK_SCORE):
+            phase = "red_weak"
+        elif (score >= float(CTT_GREEN_STRONG_SCORE)) and (len(confirmers) >= int(CTT_CONFIRMERS_STRONG_MIN)):
+            phase = "green_strong"
+        elif score >= float(CTT_GREEN_WEAK_SCORE):
+            phase = "green_weak"
+        else:
+            phase = "neutral"
+
+        lag_ok = bool(float(CTT_LAG_MIN_S) <= wave_age <= float(CTT_LAG_MAX_S))
+
+        out.update({
+            "phase": phase,
+            "score": float(score),
+            "redu_ratio": float(redu_ratio),
+            "expired": bool(expired),
+            "lag_ok": bool(lag_ok),
+            "wave_age_s": float(wave_age),
+        })
+        CTT_STATE["phase"] = str(phase)
+        CTT_STATE["score"] = float(score)
+        CTT_STATE["confirmers"] = list(confirmers)
+        CTT_STATE["confirmers_n"] = len(confirmers)
+        CTT_STATE["redu_ratio"] = float(redu_ratio)
+        CTT_STATE["expired"] = bool(expired)
+        CTT_STATE["lag_ok"] = bool(lag_ok)
+        return out
+    except Exception:
+        return out
+
+
 def _actualizar_compuerta_techo_dinamico() -> dict:
     """
     Actualiza el techo dinámico y evalúa la compuerta REAL del mejor bot del tick.
@@ -12445,6 +12579,13 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
         "new_open": False,
         "gate_mode": "A",
         "stall_s": float(stall_s),
+        "ctt_phase": "neutral",
+        "ctt_score": 0.0,
+        "ctt_confirmers": [],
+        "ctt_confirmers_n": 0,
+        "ctt_redu_ratio": 0.0,
+        "ctt_expired": False,
+        "ctt_lag_ok": False,
     }
     try:
         DYN_ROOF_STATE["tick"] = int(DYN_ROOF_STATE.get("tick", 0) or 0) + 1
@@ -12467,6 +12608,13 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
         if not live:
             DYN_ROOF_STATE["confirm_bot"] = None
             DYN_ROOF_STATE["confirm_streak"] = 0
+            CTT_STATE["phase"] = "neutral"
+            CTT_STATE["score"] = 0.0
+            CTT_STATE["confirmers"] = []
+            CTT_STATE["confirmers_n"] = 0
+            CTT_STATE["redu_ratio"] = 0.0
+            CTT_STATE["lag_ok"] = False
+            CTT_STATE["expired"] = False
             return out
 
         live.sort(key=lambda x: x[1], reverse=True)
@@ -12554,6 +12702,18 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
         if modo_relajado_n15 and (not reliable_mode):
             roof_eff = float(max(float(floor_now), float(roof_eff - float(DYN_ROOF_UNRELIABLE_ROOF_OFFSET))))
 
+        # CTT-Fase (consenso confirmadores): más duro para bloquear en rojo;
+        # en verde solo habilita relajación contextual (no dispara por sí solo).
+        ctt = _ctt_phase_confirmers(live, floor_now=floor_now, best_bot=str(best_bot), p_best=float(p_best))
+        ctt_phase = str(ctt.get("phase", "neutral") or "neutral")
+        ctt_lag_ok = bool(ctt.get("lag_ok", False))
+        ctt_expired = bool(ctt.get("expired", False))
+        if ctt_phase == "red_strong":
+            roof_eff += float(CTT_RED_STRONG_ROOF_BUMP)
+        elif ctt_phase == "red_weak":
+            roof_eff += float(CTT_RED_WEAK_ROOF_BUMP)
+        roof_eff = float(max(float(floor_now), min(0.99, float(roof_eff))))
+
         # GAP dinámico:
         # - Si solo hay 1 bot válido, no se bloquea por GAP.
         # - En modo relajado (n>=15 en todos) pedimos micro-GAP cuando hay
@@ -12589,6 +12749,20 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
         mode_c_active = bool(mode_c_candidate and float(p_best) < float(floor_now))
         gate_mode = "C" if mode_c_active else ("B" if modo_relajado_n15 else "A")
         floor_eff = float(DYN_ROOF_MODE_C_FLOOR) if mode_c_active else float(floor_now)
+
+        if ctt_phase == "red_strong":
+            floor_eff += float(CTT_RED_STRONG_FLOOR_BUMP)
+        elif ctt_phase == "red_weak":
+            floor_eff += float(CTT_RED_WEAK_FLOOR_BUMP)
+        elif (ctt_phase == "green_strong") and ctt_lag_ok and (not ctt_expired):
+            floor_eff = max(float(AUTO_REAL_UNRELIABLE_FLOOR), float(floor_eff - float(CTT_GREEN_STRONG_FLOOR_RELAX)))
+
+        if (ctt_phase == "green_strong") and ctt_lag_ok and (not ctt_expired):
+            roof_eff = max(float(floor_eff), float(roof_eff - float(CTT_GREEN_STRONG_ROOF_RELAX)))
+        elif (ctt_phase == "green_weak") and ctt_lag_ok and (not ctt_expired):
+            roof_eff = max(float(floor_eff), float(roof_eff - float(CTT_GREEN_WEAK_ROOF_RELAX)))
+        floor_eff = float(max(0.50, min(0.99, float(floor_eff))))
+        roof_eff = float(max(float(floor_eff), min(0.99, float(roof_eff))))
 
         # En modo relajado (n>=15 en todos): usar piso dinámico basado en el
         # mayor p_best reciente (techo vivo) con margen y candados de GAP/confirm.
@@ -12638,6 +12812,9 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
         DYN_ROOF_STATE["confirm_streak"] = int(confirm_streak)
 
         confirm_need = int(DYN_ROOF_MODE_C_CONFIRM_TICKS if mode_c_active else DYN_ROOF_CONFIRM_TICKS)
+        if ctt_phase in ("red_strong", "red_weak"):
+            confirm_need += int(CTT_RED_EXTRA_CONFIRM)
+        confirm_need = int(max(1, min(5, confirm_need)))
         allow_real = bool(pass_gate and (confirm_streak >= int(confirm_need)))
         allow_real_prev = bool(DYN_ROOF_STATE.get("allow_real_prev", False))
         gate_consumed = bool(DYN_ROOF_STATE.get("gate_consumed", False))
@@ -12765,6 +12942,13 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
             "clone_flat": bool(clone_flat),
             "smart_clone_override": bool(smart_clone_override),
             "spread_std": float(spread_std),
+            "ctt_phase": str(ctt_phase),
+            "ctt_score": float(ctt.get("score", 0.0) or 0.0),
+            "ctt_confirmers": list(ctt.get("confirmers", []) or []),
+            "ctt_confirmers_n": int(ctt.get("confirmers_n", 0) or 0),
+            "ctt_redu_ratio": float(ctt.get("redu_ratio", 0.0) or 0.0),
+            "ctt_expired": bool(ctt_expired),
+            "ctt_lag_ok": bool(ctt_lag_ok),
         })
         return out
     except Exception:
