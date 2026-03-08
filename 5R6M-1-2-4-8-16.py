@@ -203,6 +203,14 @@ IA_SENSOR_MIN_SAMPLE = 30
 IA_REDUNDANCY_SCORE_PENALTY = 0.03
 IA_SENSOR_PLANO_SCORE_PENALTY = 0.04
 IA_SUCESO_SCORE_WEIGHT = 0.08
+# Candado global CTT (Contexto Táctico Total): prioriza contexto antes del ranking final.
+CTT_ENABLE = True
+CTT_MIN_ACTIVE_BOTS = 4
+CTT_STATE_BLOCKED_MAX = -0.10
+CTT_STATE_WEAK_MIN = 0.12
+CTT_STATE_STRONG_MIN = 0.32
+CTT_MIN_DIVERSITY_FOR_STRONG = 0.45
+CTT_MIN_GREEN_MASS_FOR_STRONG = 0.58
 IA_OBSERVE_THR = 0.70
 AUTO_REAL_THR = IA_OBJETIVO_REAL_THR      # techo dinámico objetivo (70%)
 AUTO_REAL_BASE_FLOOR = 0.60                 # piso base dinámico para evitar bloqueo permanente en MODELO experimental
@@ -1009,7 +1017,7 @@ def write_token_atomic(path, content):
 # 2) fulll50/fulll45: rendimiento similar pero con muestra algo mayor.
 # 3) fulll48: intermedio, baja muestra.
 # 4) fulll49/fulll46: sobreconfianza alta y peor hit-rate reciente.
-BOT_NAMES = ["fulll47", "fulll50", "fulll45", "fulll48", "fulll49", "fulll46"]
+BOT_NAMES = [f"fulll{i}" for i in range(45, 60)]
 IA53_TRIGGERED = {bot: False for bot in BOT_NAMES}
 IA53_LAST_TS = {bot: 0.0 for bot in BOT_NAMES}
 TOKEN_FILE = "token_actual.txt"
@@ -1082,6 +1090,15 @@ estado_bots = {
     for bot in BOT_NAMES
 }
 IA90_stats = {bot: {"n": 0, "ok": 0, "pct": 0.0, "pct_raw": 0.0, "pct_smooth": 50.0} for bot in BOT_NAMES}
+CTT_STATE = {
+    "state": "CTT_NEUTRO",
+    "score": 0.0,
+    "green_mass": 0.0,
+    "red_mass": 0.0,
+    "active": 0,
+    "diversity": 0.0,
+    "ts": 0.0,
+}
 # Ventana corta para diagnosticar el bloqueo dominante del embudo en HUD.
 HUD_BLOQUEO_WINDOW = 120
 HUD_BLOQUEOS_RECIENTES = deque(maxlen=HUD_BLOQUEO_WINDOW)
@@ -12182,13 +12199,132 @@ def _todos_bots_con_n_minimo_real(min_n: int | None = None) -> bool:
     """True si TODOS los bots alcanzaron el mínimo de muestra para habilitar umbral REAL reducido."""
     try:
         n_req = int(IA_ACTIVACION_REAL_MIN_N_POR_BOT if min_n is None else min_n)
-        for b in BOT_NAMES:
+        bots_eval = _bots_activos_para_control() or list(BOT_NAMES)
+        for b in bots_eval:
             n_b = int(estado_bots.get(b, {}).get("tamano_muestra", 0) or 0)
             if n_b < n_req:
                 return False
         return True
     except Exception:
         return False
+
+
+def _bots_activos_para_control() -> list[str]:
+    """Bots activos para candados globales: evita bloquear por bots aún no desplegados."""
+    activos = []
+    try:
+        for b in BOT_NAMES:
+            n_b = int(estado_bots.get(b, {}).get("tamano_muestra", 0) or 0)
+            csv_ok = os.path.exists(f"registro_enriquecido_{b}.csv")
+            if csv_ok or n_b > 0:
+                activos.append(b)
+    except Exception:
+        return []
+    return activos
+
+
+def _calcular_ctt_ponderado() -> dict:
+    """Calcula CTT ponderado usando prob IA operativa, evidencia, salud y diversidad del tick."""
+    global CTT_STATE
+    base = {
+        "state": "CTT_NEUTRO",
+        "score": 0.0,
+        "green_mass": 0.0,
+        "red_mass": 0.0,
+        "active": 0,
+        "diversity": 0.0,
+        "ts": float(time.time()),
+    }
+    try:
+        activos = _bots_activos_para_control()
+        if not activos:
+            CTT_STATE = dict(base)
+            return dict(CTT_STATE)
+
+        total_w = 0.0
+        green_w = 0.0
+        red_w = 0.0
+        families = set()
+        for b in activos:
+            st = estado_bots.get(b, {})
+            p = _prob_ia_operativa_bot(b, default=None)
+            if not isinstance(p, (int, float)):
+                continue
+            p = float(max(0.0, min(1.0, p)))
+            ev_n = float(st.get("ia_evidence_n", 0) or 0.0)
+            ev_wr = float(st.get("ia_evidence_wr", 0.0) or 0.0)
+            reg = float(st.get("ia_regime_score", 0.0) or 0.0)
+            redund = bool(st.get("ia_input_redundante", False))
+
+            w = (0.40 * p) + (0.25 * min(1.0, ev_n / 120.0)) + (0.20 * max(0.0, min(1.0, ev_wr))) + (0.15 * max(0.0, min(1.0, reg)))
+            if redund:
+                w *= 0.85
+            if w <= 0.0:
+                continue
+
+            total_w += w
+            if p >= float(_umbral_real_operativo_actual()):
+                green_w += w
+            else:
+                red_w += w
+
+            fam = str(st.get("ia_input_dup_group", "") or "").strip()
+            families.add(fam if fam else b)
+
+        active = int(len(activos))
+        if total_w <= 0.0 or active <= 0:
+            CTT_STATE = dict(base)
+            return dict(CTT_STATE)
+
+        green_mass = float(green_w / total_w)
+        red_mass = float(red_w / total_w)
+        diversity = float(min(1.0, len(families) / max(1, active)))
+        score = float(green_mass - red_mass + (0.20 * (diversity - 0.5)))
+
+        if active < int(CTT_MIN_ACTIVE_BOTS):
+            state = "CTT_NEUTRO"
+        elif score <= float(CTT_STATE_BLOCKED_MAX):
+            state = "CTT_BLOQUEADO"
+        elif score >= float(CTT_STATE_STRONG_MIN) and green_mass >= float(CTT_MIN_GREEN_MASS_FOR_STRONG) and diversity >= float(CTT_MIN_DIVERSITY_FOR_STRONG):
+            state = "CTT_VERDE_FUERTE"
+        elif score >= float(CTT_STATE_WEAK_MIN):
+            state = "CTT_VERDE_DEBIL"
+        else:
+            state = "CTT_NEUTRO"
+
+        CTT_STATE = {
+            "state": state,
+            "score": score,
+            "green_mass": green_mass,
+            "red_mass": red_mass,
+            "active": active,
+            "diversity": diversity,
+            "ts": float(time.time()),
+        }
+        return dict(CTT_STATE)
+    except Exception:
+        CTT_STATE = dict(base)
+        return dict(CTT_STATE)
+
+
+def _aplicar_filtro_diversidad(candidatos: list) -> list:
+    """Deja solo 1 bot por familia de duplicación por tick (top score de la familia)."""
+    if not isinstance(candidatos, list) or not candidatos:
+        return []
+    filtrados = []
+    familias = set()
+    for c in candidatos:
+        try:
+            b = str(c[1])
+            fam = str(estado_bots.get(b, {}).get("ia_input_dup_group", "") or "").strip()
+            key = fam if fam else b
+            if key in familias:
+                continue
+            familias.add(key)
+            filtrados.append(c)
+        except Exception:
+            continue
+    return filtrados
 
 
 def _umbral_real_operativo_actual() -> float:
@@ -12221,7 +12357,8 @@ def _n_minimo_real_status() -> tuple[int, int]:
     """Retorna (mínimo n actual entre bots, n requerido) para diagnóstico en HUD."""
     try:
         n_req = int(IA_ACTIVACION_REAL_MIN_N_POR_BOT)
-        n_vals = [int(estado_bots.get(b, {}).get("tamano_muestra", 0) or 0) for b in BOT_NAMES]
+        bots_eval = _bots_activos_para_control() or list(BOT_NAMES)
+        n_vals = [int(estado_bots.get(b, {}).get("tamano_muestra", 0) or 0) for b in bots_eval]
         n_min = min(n_vals) if n_vals else 0
         return int(n_min), int(n_req)
     except Exception:
@@ -13764,6 +13901,36 @@ async def main():
                                     continue
 
                             candidatos.sort(key=lambda x: x[0], reverse=True)
+                            candidatos = _aplicar_filtro_diversidad(candidatos)
+
+                            ctt = _calcular_ctt_ponderado() if bool(CTT_ENABLE) else {"state": "CTT_VERDE_FUERTE"}
+                            ctt_state = str(ctt.get("state", "CTT_NEUTRO"))
+                            if ctt_state == "CTT_BLOQUEADO":
+                                if candidatos:
+                                    agregar_evento(
+                                        "🚫 CTT bloqueado: contexto global adverso, se cancela entrada REAL. "
+                                        f"score={float(ctt.get('score',0.0)):+.2f} "
+                                        f"verde={float(ctt.get('green_mass',0.0))*100:.1f}% "
+                                        f"div={float(ctt.get('diversity',0.0))*100:.1f}%"
+                                    )
+                                candidatos = []
+                            elif ctt_state == "CTT_NEUTRO":
+                                if candidatos:
+                                    agregar_evento(
+                                        "🟦 CTT neutro: se prioriza cautela (sin REAL nuevo hasta contexto favorable)."
+                                    )
+                                candidatos = []
+                            elif ctt_state == "CTT_VERDE_DEBIL":
+                                umbral_debil = float(_umbral_real_operativo_actual()) + 0.01
+                                candidatos = [c for c in candidatos if float(c[3]) >= umbral_debil]
+                                if candidatos:
+                                    candidatos = candidatos[:1]
+                                else:
+                                    agregar_evento(
+                                        "🟨 CTT verde débil: sin candidato con margen de seguridad adicional."
+                                    )
+                            else:
+                                candidatos = candidatos[:3]
 
                             # Selección automática: tomar la mejor señal elegible >= umbral REAL vigente.
 
