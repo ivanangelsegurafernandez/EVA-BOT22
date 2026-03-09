@@ -185,6 +185,9 @@ IA_ACTIVACION_REAL_THR_POST_N15 = 0.58  # post-n15: bajar piso operativo para de
 IA_ACTIVACION_REAL_THR_POST_N15_UNREL = 0.56
 IA_ACTIVACION_REAL_THR_POST_N15_UNREL_MIN_SAMPLES = 300
 IA_ACTIVACION_REAL_MIN_N_POR_BOT = 15   # condición: todos los bots deben tener al menos n=15
+IA_ACTIVACION_REAL_COHORTE_MIN_BOTS = 3
+IA_ACTIVACION_REAL_COHORTE_RATIO = 0.45
+IA_ACTIVACION_REAL_COHORTE_LEADER_SLACK = 2
 
 # --- Oráculo visual ---
 ORACULO_THR_MIN   = IA_ACTIVACION_REAL_THR
@@ -232,6 +235,10 @@ CTT_OPERABLE_ALLOW_NACIMIENTO = True
 CTT_OPERABLE_NACIMIENTO_MIN_FRANJA = 0.58
 CTT_OPERABLE_NACIMIENTO_MIN_COHESION = 0.70
 CTT_OPERABLE_NACIMIENTO_MIN_GREEN_MASS = 0.30
+CTT_CASI_OPERABLE_ENABLE = True
+CTT_CASI_OPERABLE_MIN_GREEN_MASS = 0.34
+CTT_CASI_OPERABLE_MIN_COHESION = 0.66
+CTT_CASI_OPERABLE_SCORE_MIN = 0.06
 CTT_BUILD_TAG = "ctt-operable-v1"
 # Priorización de rezagados (solo cuando CTT ya habilitó evaluación).
 REZAGADOS_ENABLE = True
@@ -650,8 +657,8 @@ def _shadow_micro_gate_ok(candidatos: list, dyn_gate: dict | None = None) -> tup
             return False, "off"
         if not candidatos:
             return False, "sin_candidatos"
-        if not bool(_todos_bots_con_n_minimo_real()):
-            return False, "n_min_real"
+        if not bool(_cohorte_madura_minima_ok(candidatos)):
+            return False, "n_min_real_cohorte"
 
         dgate = dyn_gate if isinstance(dyn_gate, dict) else {}
         confirm_need = int(dgate.get("confirm_need", DYN_ROOF_CONFIRM_TICKS) or DYN_ROOF_CONFIRM_TICKS)
@@ -9267,6 +9274,42 @@ def _dataset_quality_gate_for_training(X_df: pd.DataFrame, feats: list[str]):
         return False, reasons, (health if isinstance(health, dict) else {})
 
 
+def _aplicar_fallback_data_quality(X_df: pd.DataFrame, feats: list[str], health: dict | None = None) -> tuple[pd.DataFrame, list[str], bool]:
+    """Fallback de entrenamiento cuando la ruta ideal falla por calidad de features."""
+    try:
+        if X_df is None or X_df.empty or not feats:
+            return X_df, feats, False
+        h = health if isinstance(health, dict) else _auditar_salud_features(X_df, feats)
+        if not isinstance(h, dict) or not h:
+            return X_df, feats, False
+
+        fallback_pref = [
+            "puntaje_estrategia", "payout", "racha_actual", "sma_spread",
+            "breakout", "cruce_sma", "rsi_14", "rsi_9", "sma_5", "sma_20",
+        ]
+        fallback = []
+        for c in fallback_pref:
+            if c in X_df.columns and c in feats:
+                rep = h.get(c, {}) if isinstance(h.get(c, {}), dict) else {}
+                if str(rep.get("status", "")).upper() == "OK":
+                    fallback.append(c)
+        if len(fallback) < 3:
+            for c in feats:
+                if c in fallback or c not in X_df.columns:
+                    continue
+                rep = h.get(c, {}) if isinstance(h.get(c, {}), dict) else {}
+                if str(rep.get("status", "")).upper() == "OK":
+                    fallback.append(c)
+                if len(fallback) >= 4:
+                    break
+        if len(fallback) < 3:
+            return X_df, feats, False
+        X_fb = X_df[fallback].copy()
+        return X_fb, fallback, True
+    except Exception:
+        return X_df, feats, False
+
+
 def _fingerprint_features_row(row: dict, feats: list[str] | None = None, decimals: int = INPUT_DUP_FINGERPRINT_DECIMALS) -> str:
     """Huella estable por bot/tick para detectar inputs duplicados entre bots."""
     base_feats = list(feats) if feats else list(INCREMENTAL_FEATURES_V2)
@@ -9604,14 +9647,33 @@ def maybe_retrain(force: bool = False):
         dq_ok, dq_reasons, dq_health = _dataset_quality_gate_for_training(X, feats_used)
         health_before = dq_health if isinstance(dq_health, dict) and dq_health else health_before
         if not dq_ok:
+            tried_fallback = False
+            if any(str(r).startswith("features_ok_bajas") for r in (dq_reasons or [])):
+                X_fb, feats_fb, fb_ok = _aplicar_fallback_data_quality(X, feats_used, health_before)
+                if fb_ok:
+                    dq_ok_fb, dq_reasons_fb, dq_health_fb = _dataset_quality_gate_for_training(X_fb, feats_fb)
+                    if dq_ok_fb:
+                        X = X_fb
+                        feats_used = list(feats_fb)
+                        dq_ok = True
+                        tried_fallback = True
+                        health_before = dq_health_fb if isinstance(dq_health_fb, dict) and dq_health_fb else health_before
+                        try:
+                            agregar_evento(f"🛟 IA DATA QUALITY fallback: entrenamiento con subset robusto ({len(feats_used)} feats).")
+                        except Exception:
+                            pass
             try:
-                agregar_evento(f"🛑 IA DATA QUALITY: entrenamiento bloqueado ({'; '.join(dq_reasons)}).")
+                if not dq_ok:
+                    agregar_evento(f"🛑 IA DATA QUALITY: entrenamiento bloqueado ({'; '.join(dq_reasons)}).")
             except Exception:
                 pass
-            # Si no existe ningún modelo, intentar fallback simple para salir de OFF.
-            if not _hay_modelo_ia_disponible():
-                return _maybe_retrain_fallback_sklearn(force=True)
-            return False
+            if tried_fallback and dq_ok:
+                dq_reasons = []
+            if not dq_ok:
+                # Si no existe ningún modelo, intentar fallback simple para salir de OFF.
+                if not _hay_modelo_ia_disponible():
+                    return _maybe_retrain_fallback_sklearn(force=True)
+                return False
 
         # 4.2) Reducir features casi constantes/redundantes para subir eficiencia real
         X, feats_used, dropped_feats = _seleccionar_features_utiles_train(X, feats_used)
@@ -10701,6 +10763,7 @@ def mostrar_panel():
             roof_ok = bool(best_prob >= float(roof_h))
             confirm_ok = bool(confirm_h >= confirm_need_h)
             trig_ok = bool(trigger_ok_h)
+            trig_ctx = bool(DYN_ROOF_STATE.get("last_trigger_context", False))
             rel_ok = bool(reliable)
             can_ok = bool(canary_live)
             classic_ok = bool(best_prob >= float(AUTO_REAL_THR_MIN))
@@ -10708,16 +10771,19 @@ def mostrar_panel():
             p_diag = float(best_prob)
             p_model = float(best_prob)
             ctt_live_state = str((CTT_STATE or {}).get("state", "CTT_OBSERVAR"))
-            ctt_bridge = ctt_live_state == "CTT_ZONA_VERDE_OPERABLE"
+            ctt_bridge = ctt_live_state in ("CTT_ZONA_VERDE_OPERABLE", "CTT_CASI_OPERABLE")
             if confirm_ok and trig_ok and (rel_ok or can_ok or auto_adapt_ok):
                 p_oper = float(best_prob)
             elif ctt_bridge and bool(AUTO_REAL_ALLOW_UNRELIABLE_POST_N15):
                 # Warmup bridge: penalizar fuerte en vez de anular a 0.
                 p_oper = float(max(0.0, float(best_prob) - 0.08))
+            elif ctt_bridge and trig_ctx:
+                # Casi-operable + trigger contextual: competir en modo puente.
+                p_oper = float(max(0.0, float(best_prob) - 0.10))
             else:
                 p_oper = 0.0
             modo_score = "MODEL" if str(estado_bots.get(mejor[0], {}).get("modo_ia", "off")).lower() == "modelo" else str(estado_bots.get(mejor[0], {}).get("modo_ia", "off")).upper()
-            ctt_ok_hud = ctt_live_state in ("CTT_ZONA_VERDE_OPERABLE", "CTT_HABILITA_EVALUACION", "CTT_HABILITA_PRIORIDAD_REAL")
+            ctt_ok_hud = ctt_live_state in ("CTT_CASI_OPERABLE", "CTT_ZONA_VERDE_OPERABLE", "CTT_HABILITA_EVALUACION", "CTT_HABILITA_PRIORIDAD_REAL")
 
             funnel_checks = [
                 ("CTT", ctt_ok_hud),
@@ -12334,6 +12400,32 @@ def _todos_bots_con_n_minimo_real(min_n: int | None = None) -> bool:
         for b in bots_eval:
             n_b = int(estado_bots.get(b, {}).get("tamano_muestra", 0) or 0)
             if n_b < n_req:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def _cohorte_madura_minima_ok(candidatos: list | None = None, min_n: int | None = None) -> bool:
+    """True si hay cohorte útil madura sin exigir pelotón completo."""
+    try:
+        n_req = int(IA_ACTIVACION_REAL_MIN_N_POR_BOT if min_n is None else min_n)
+        bots_eval = _bots_activos_para_control() or list(BOT_NAMES)
+        if not bots_eval:
+            return False
+
+        n_vals = [int(estado_bots.get(b, {}).get("tamano_muestra", 0) or 0) for b in bots_eval]
+        maduros = sum(1 for n in n_vals if n >= n_req)
+        min_maduros = max(int(IA_ACTIVACION_REAL_COHORTE_MIN_BOTS), int(math.ceil(len(bots_eval) * float(IA_ACTIVACION_REAL_COHORTE_RATIO))))
+        if maduros < min_maduros:
+            return False
+
+        if candidatos:
+            try:
+                best_bot = str(candidatos[0][1])
+                n_best = int(estado_bots.get(best_bot, {}).get("tamano_muestra", 0) or 0)
+                return bool(n_best >= max(1, n_req - int(IA_ACTIVACION_REAL_COHORTE_LEADER_SLACK)))
+            except Exception:
                 return False
         return True
     except Exception:
@@ -14377,10 +14469,27 @@ def _calcular_ctt_ponderado() -> dict:
         CTT_SCORE_HISTORY.append(float(score))
         score_recent = float(sum(CTT_SCORE_HISTORY) / max(1, len(CTT_SCORE_HISTORY)))
 
+        meta_live = _ORACLE_CACHE.get("meta") or leer_model_meta() or {}
+        n_samples = int(meta_live.get("n_samples", meta_live.get("n", 0)) or 0)
+        warmup_mode = bool(meta_live.get("warmup_mode", n_samples < int(TRAIN_WARMUP_MIN_ROWS)))
+        reliable_mode = bool(meta_live.get("reliable", False)) and (not warmup_mode)
+
+        casi_operable = bool(
+            bool(CTT_CASI_OPERABLE_ENABLE)
+            and (not reliable_mode)
+            and (fr_phase in ("expansion", "madurez", "nacimiento"))
+            and persist_ok
+            and (fr_cohesion >= float(CTT_CASI_OPERABLE_MIN_COHESION))
+            and (green_mass >= float(CTT_CASI_OPERABLE_MIN_GREEN_MASS))
+            and (score_recent >= float(CTT_CASI_OPERABLE_SCORE_MIN))
+        )
+
         if active < int(CTT_MIN_ACTIVE_BOTS):
             state = "CTT_OBSERVAR"
         elif fr_phase == "agotamiento":
             state = "CTT_BLOQUEADO"
+        elif casi_operable:
+            state = "CTT_CASI_OPERABLE"
         elif (score_recent <= float(CTT_STATE_BLOCKED_MAX)) or (green_mass < 0.40 and red_mass > 0.60):
             state = "CTT_BLOQUEADO"
         elif (
@@ -15779,13 +15888,13 @@ def _actualizar_compuerta_techo_dinamico() -> dict:
             ctt_state_now = "CTT_OBSERVAR"
         if (
             bool(CTT_OPERABLE_ENABLE)
-            and ctt_state_now == "CTT_ZONA_VERDE_OPERABLE"
+            and ctt_state_now in ("CTT_ZONA_VERDE_OPERABLE", "CTT_CASI_OPERABLE")
             and (not reliable_mode)
         ):
-            near_floor_ctx = bool(float(p_best) >= float(max(floor_eff, roof_eff - 0.02)))
+            near_floor_ctx = bool(float(p_best) >= float(max(floor_eff - 0.01, roof_eff - 0.025)))
             # En modo puente permitimos confirmación más flexible (no anular por 0/1 aislado).
             confirm_ctx = bool(int(confirm_streak) >= max(0, int(confirm_need) - 1))
-            trigger_context = bool(near_floor_ctx and confirm_ctx and (suceso_ok or trigger_pattern or trigger_soft))
+            trigger_context = bool(near_floor_ctx and confirm_ctx and (suceso_ok or trigger_pattern or trigger_soft or (float(p_best) >= float(floor_eff))))
             trigger_ok = bool(trigger_ok or trigger_context)
         if warmup_mode and (not mode_c_active):
             # En modo B (post-n15) no anular trigger por warmup si la compuerta ya
@@ -16984,7 +17093,7 @@ async def main():
                         # Candado maestro CTT (clima global) antes de compuerta ROOF.
                         ctt = _calcular_ctt_ponderado() if bool(CTT_ENABLE) else {"state": "CTT_HABILITA_PRIORIDAD_REAL"}
                         ctt_state = str(ctt.get("state", "CTT_OBSERVAR"))
-                        ctt_eval_open = ctt_state in ("CTT_ZONA_VERDE_OPERABLE", "CTT_HABILITA_EVALUACION", "CTT_HABILITA_PRIORIDAD_REAL")
+                        ctt_eval_open = ctt_state in ("CTT_CASI_OPERABLE", "CTT_ZONA_VERDE_OPERABLE", "CTT_HABILITA_EVALUACION", "CTT_HABILITA_PRIORIDAD_REAL")
 
                         if bool(CTT_ENABLE):
                             now_ctt = float(time.time())
@@ -17003,10 +17112,10 @@ async def main():
                                         "🟦 CTT observar: aún sin franja verde aprovechable "
                                         f"(phase={ctt.get('franja_phase','--')}, persist={'sí' if ctt.get('persist_ok') else 'no'})."
                                     )
-                                elif ctt_state == "CTT_ZONA_VERDE_OPERABLE":
+                                elif ctt_state in ("CTT_ZONA_VERDE_OPERABLE", "CTT_CASI_OPERABLE"):
                                     CTT_LAST_LOG_TS = now_ctt
                                     agregar_evento(
-                                        "🟨 CTT zona operable: habilita modo puente (warmup) con cupo micro-controlado."
+                                        "🟨 CTT casi-operable: habilita modo puente (warmup) con cupo micro-controlado."
                                     )
 
                         # Umbral maestro calibrado con históricos de Prob IA (top quantil),
@@ -17081,7 +17190,7 @@ async def main():
                                         # Incluso en compuerta clásica, aplicar capa de rezagados útiles.
                                         rez_tipo = "no_rezagado"
                                         rez_score = 0.0
-                                        if ctt_state in ("CTT_ZONA_VERDE_OPERABLE", "CTT_HABILITA_EVALUACION", "CTT_HABILITA_PRIORIDAD_REAL") and bool(REZAGADOS_ENABLE):
+                                        if ctt_state in ("CTT_CASI_OPERABLE", "CTT_ZONA_VERDE_OPERABLE", "CTT_HABILITA_EVALUACION", "CTT_HABILITA_PRIORIDAD_REAL") and bool(REZAGADOS_ENABLE):
                                             rez_tipo, rez_score = _clasificar_rezagado(b, ctt=ctt, ctx=ctx)
                                             fr_phase = str((ctt or {}).get("franja_phase", "") or "")
                                             if rez_tipo == "sano":
@@ -17236,7 +17345,7 @@ async def main():
                                     # Priorización de rezagados: solo si CTT abrió evaluación.
                                     rez_tipo = "no_rezagado"
                                     rez_score = 0.0
-                                    if ctt_state in ("CTT_ZONA_VERDE_OPERABLE", "CTT_HABILITA_EVALUACION", "CTT_HABILITA_PRIORIDAD_REAL") and bool(REZAGADOS_ENABLE):
+                                    if ctt_state in ("CTT_CASI_OPERABLE", "CTT_ZONA_VERDE_OPERABLE", "CTT_HABILITA_EVALUACION", "CTT_HABILITA_PRIORIDAD_REAL") and bool(REZAGADOS_ENABLE):
                                         rez_tipo, rez_score = _clasificar_rezagado(b, ctt=ctt, ctx=ctx)
                                         fr_phase = str((ctt or {}).get("franja_phase", "") or "")
                                         if rez_tipo == "sano":
@@ -17269,7 +17378,7 @@ async def main():
                             candidatos = _aplicar_filtro_diversidad(candidatos)
 
                             if bool(CTT_ENABLE):
-                                if ctt_state == "CTT_ZONA_VERDE_OPERABLE":
+                                if ctt_state in ("CTT_ZONA_VERDE_OPERABLE", "CTT_CASI_OPERABLE"):
                                     # Puente: 1 candidato con cupo temporal estricto.
                                     left_q, used_q, win_q = _ctt_operable_quota_status()
                                     candidatos = [c for c in candidatos if float(c[3]) >= float(CTT_OPERABLE_MIN_PROB)]
@@ -17591,7 +17700,7 @@ async def main():
                                                 _REAL_SHADOW_MICRO_OPEN_TS.append(float(time.time()))
                                             except Exception:
                                                 pass
-                                        if ctt_state == "CTT_ZONA_VERDE_OPERABLE":
+                                        if ctt_state in ("CTT_ZONA_VERDE_OPERABLE", "CTT_CASI_OPERABLE"):
                                             try:
                                                 CTT_OPERABLE_OPEN_TS.append(float(time.time()))
                                             except Exception:
