@@ -12446,6 +12446,17 @@ def _calcular_ctt_ponderado() -> dict:
         red_w = 0.0
         families = set()
         p_live_best = 0.0
+        # Umbral verde CTT: en warmup/unreliable usar margen puente para evitar verde=0 crónico por décimas.
+        ctt_green_thr = float(_umbral_real_operativo_actual())
+        try:
+            meta_live = _ORACLE_CACHE.get("meta") or leer_model_meta() or {}
+            n_samples_meta = int(meta_live.get("n_samples", meta_live.get("n", 0)) or 0)
+            warmup_mode = bool(meta_live.get("warmup_mode", n_samples_meta < int(TRAIN_WARMUP_MIN_ROWS)))
+            reliable_mode = bool(meta_live.get("reliable", False)) and (not warmup_mode)
+            if warmup_mode or (not reliable_mode):
+                ctt_green_thr = float(max(0.50, ctt_green_thr - float(CTT_OPERABLE_FLOOR_MARGIN)))
+        except Exception:
+            pass
         for b in activos:
             st = estado_bots.get(b, {})
             p = _prob_ia_operativa_bot(b, default=None)
@@ -12465,7 +12476,7 @@ def _calcular_ctt_ponderado() -> dict:
                 continue
 
             total_w += w
-            if p >= float(_umbral_real_operativo_actual()):
+            if p >= float(ctt_green_thr):
                 green_w += w
             else:
                 red_w += w
@@ -13771,7 +13782,7 @@ def _boot_health_check():
                 msgs.append("⚠️ CTT contrato incompleto: faltan piezas operables en esta copia.")
                 contract_issues.append("ctt_contract_incomplete")
         except Exception:
-            pass
+            contract_issues.append("ctt_contract_check_error")
 
         try:
             globals()["CTT_CONTRACT_OK"] = bool(len(contract_issues) == 0)
@@ -14531,10 +14542,11 @@ async def main():
                                 auc_live = float(meta_live.get("auc", 0.0) or 0.0)
                                 warmup_live = bool(meta_live.get("warmup_mode", n_samples_live < int(TRAIN_WARMUP_MIN_ROWS)))
                                 post_n15 = bool(_todos_bots_con_n_minimo_real())
-                                best_prob = max((float(x[2]) for x in candidatos), default=0.0)
+                                # Usar prob operativa/posterior del embudo (x[3]), no solo p_model (x[2]).
+                                best_prob = max((float(x[3]) for x in candidatos), default=0.0)
                                 best_bot_local = None
                                 try:
-                                    best_bot_local = max(candidatos, key=lambda x: float(x[2]))[1] if candidatos else None
+                                    best_bot_local = max(candidatos, key=lambda x: float(x[3]))[1] if candidatos else None
                                 except Exception:
                                     best_bot_local = None
                                 unrel_thr_live = float(_umbral_unrel_operativo(best_bot_local, best_prob))
